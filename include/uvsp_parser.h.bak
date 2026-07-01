@@ -1,0 +1,238 @@
+#pragma once
+#include <pthread.h>
+#include <cstdint>
+#include <unordered_map>
+#include <map>
+#include <vector>
+#include <queue>
+
+namespace uvsp {
+
+const uint16_t MAGIC_FULL = 0x5654;
+const uint16_t MAGIC_LITE = 0x5653;
+
+const uint8_t FLAG_SOF =0X02;
+const uint8_t FLAG_EOF =0X01;
+const uint8_t FLAG_GAP = 0x04;
+const uint8_t FLAG_RST = 0x08;
+
+struct VideoConfig {
+    int width;
+    int height;
+    int fps;
+    const char* pixel_format;
+    size_t frame_size;
+};
+
+extern VideoConfig g_cfg;
+#pragma pack(push, 1)
+
+struct BaseHeader {
+    uint16_t magic;
+    uint8_t  flags;
+    uint8_t  profile;
+    uint16_t source_id;
+    uint16_t type;
+};
+
+struct CommonTransport {
+    uint16_t seq_num;
+    uint32_t timestamp;
+    uint8_t  ext_count;
+    uint8_t  reserved;
+};
+struct ext_tvl{
+   uint32_t head;
+   uint32_t cmd; 
+};
+
+// ==============================
+// ==============================
+struct ExtTlvHeader {
+    uint8_t  type;
+    uint8_t  len;
+    uint16_t reserved;
+};
+#pragma pack(pop)
+
+const uint8_t TLV_FRAME_ID       = 0x01;
+const uint8_t TLV_CHUNK_OFFSET   = 0x02;
+const uint8_t TLV_CHUNK_LENGTH   = 0x03;
+const uint8_t TLV_TOTAL_SIZE     = 0x04;
+const uint8_t TLV_PIXFMT         = 0x05;
+const uint8_t TLV_WIDTH          = 0x06;
+const uint8_t TLV_HEIGHT         = 0x07;
+
+struct FrameInfo {
+    uint16_t id;
+    uint32_t timestamp;
+    
+    const uint8_t* data;
+    size_t size;
+};
+#pragma pack(pop)
+
+// ==============================
+// ==============================
+struct StreamStat {
+    bool initialized = false;
+
+    uint16_t last_seq = 0;
+
+   
+    uint16_t max_seq = 0;
+    uint64_t bitmap = 0;
+
+    uint64_t total = 0;
+    uint64_t lost = 0;
+    uint64_t reorder = 0;
+    uint64_t duplicate = 0;
+
+    uint64_t bytes = 0;
+    uint64_t gap = 0;
+    uint64_t frame_bytes = 0;
+    uint64_t frame_lost = 0;
+    uint64_t frame_ok = 0;
+    uint64_t frame_err = 0;
+    uint64_t ok_frame_size=0;
+};
+typedef void (*PacketCallback)(const PacketInfo&, void* user);
+typedef void (*FrameCallback)(const FrameInfo&, void* user);
+// ==============================
+// ==============================
+struct Packet {
+    const uint8_t* data;
+    uint32_t len;
+};
+
+// ==============================
+// lock-free ring queue
+// ==============================
+class RingQueue {
+public:
+    RingQueue();
+
+    bool push(const Packet& p);
+    bool pop(Packet& p);
+
+private:
+    static const int SIZE = 4096;
+    Packet buf_[SIZE];
+
+    volatile int head_;
+    volatile int tail_;
+};
+class FrameAssembler {
+public:
+    void input(uint16_t id,
+               uint16_t seq,
+               uint8_t flags,
+               uint32_t timestamp,
+               const uint8_t* payload,
+               size_t len);
+
+    void input_ext(uint16_t id,
+                   uint16_t seq,
+                   uint8_t flags,
+                   uint32_t timestamp,
+                   const uint8_t* payload,
+                   size_t len,
+                   bool has_offset,
+                   uint32_t chunk_offset,
+                   uint32_t total_size);
+
+    void set_frame_callback(FrameCallback cb, void* user)
+    {
+        frame_cb_ = cb;
+        frame_user_ = user;
+    }
+
+private:
+    static void parse_tlvs(const uint8_t* ext_data,
+                           uint8_t ext_count,
+                           bool* out_has_offset,
+                           uint32_t* out_chunk_offset,
+                           uint32_t* out_total_size);
+struct FrameBuf {
+    uint8_t* buf = nullptr;
+    size_t received = 0;
+    uint16_t id;
+    uint16_t expected_seq = 0;
+    uint32_t last_timestamp =0;
+    bool got_base = false;
+    bool initialized = false;
+
+    std::map<uint16_t, std::vector<uint8_t>> pkt_map;
+
+    std::map<uint32_t, std::vector<uint8_t>> offset_map;
+    size_t filled_size = 0;
+    uint32_t total_size = 0;
+    bool use_offset_mode = false;
+
+    std::queue<std::vector<uint8_t>> frame_queue;
+
+    pthread_mutex_t mutex;
+    pthread_t display_tid;
+    bool display_running = false;
+
+};
+    static void* display_thread(void* arg);
+    std::unordered_map<uint16_t, FrameBuf> frames_;
+    FrameCallback frame_cb_ = nullptr;
+    void* frame_user_ = nullptr;
+
+};
+// ==============================
+// parser
+// ==============================
+
+
+
+class UvspParser {
+public:
+    UvspParser();
+    ~UvspParser();
+
+    void start();
+    void stop();
+    void set_packet_callback(PacketCallback cb, void* user)
+    {
+        pkt_cb_ = cb;
+        pkt_user_ = user;
+    }
+
+    void set_frame_callback(FrameCallback cb, void* user)
+    {
+        assembler_.set_frame_callback(cb, user);
+    }
+    void push_packet(const uint8_t* data, uint32_t len);
+    const std::unordered_map<uint16_t, StreamStat>& get_stats() const;
+
+private:
+    static void* recv_thread(void* arg);
+    static void* parse_thread(void* arg);
+
+    void recv_loop();
+    void parse_loop();
+
+    void update_seq(StreamStat& s, uint16_t seq);
+
+private:
+    RingQueue queue_;
+
+    std::unordered_map<uint16_t, StreamStat> stats_;
+
+    int sock_;
+    int port_;
+
+    bool running_;
+
+    pthread_t recv_tid_;
+    pthread_t parse_tid_;
+    PacketCallback pkt_cb_ = nullptr;
+    void* pkt_user_ = nullptr;
+    FrameAssembler assembler_;
+
+};
+
+} // namespace uvsp

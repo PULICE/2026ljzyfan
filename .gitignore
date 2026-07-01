@@ -1,0 +1,18 @@
+# 编译产物
+bin/
+obj/
+*.o
+*.obj
+*.exe
+*.out
+
+# 编辑器
+.vscode/
+*.bak
+
+# pcap文件（可选，体积大）
+*.pcap
+
+# 系统
+.DS_Store
+Thumbs.db
